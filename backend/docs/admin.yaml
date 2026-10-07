@@ -1,0 +1,325 @@
+openapi: 3.0.3
+info:
+  title: Admin API
+  version: 1.0.0
+  description: Admin endpoints for classifications and users
+servers:
+  - url: /api/admin
+paths:
+  /classifications:
+    get:
+      summary: List classifications (admin)
+      description: Paginated classifications with counts and filters
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: page
+          schema: { type: integer, minimum: 1, default: 1 }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 10 }
+        - in: query
+          name: sortBy
+          schema: { type: string, default: createdAt }
+        - in: query
+          name: sortOrder
+          schema: { type: string, enum: [asc, desc], default: desc }
+        - in: query
+          name: search
+          schema: { type: string }
+        - in: query
+          name: status
+          schema: { type: string }
+        - in: query
+          name: isArchived
+          schema: { type: string, enum: [true, false, undefined] }
+        - in: query
+          name: createdAt_gte
+          schema: { type: string, format: date-time }
+        - in: query
+          name: createdAt_lte
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count: { type: integer }
+                  pages: { type: integer }
+                  totalVerifiedCount: { type: integer }
+                  totalPendingCount: { type: integer }
+                  totalArchivedCount: { type: integer }
+                  results:
+                    type: array
+                    items: { $ref: '#/components/schemas/ClassificationWithUser' }
+                  shapes:
+                    type: array
+                    items: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Unauthorized }
+        '500': { $ref: '#/components/responses/ServerError' }
+  /classification/{id}:
+    get:
+      summary: Get classification (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+                  results: { $ref: '#/components/schemas/Classification' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Unauthorized }
+        '404': { description: Not found }
+        '500': { $ref: '#/components/responses/ServerError' }
+    put:
+      summary: Update classification (admin/moderator)
+      description: Update tags, status and archive state. Only ADMIN can set status VERIFIED
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                taggedShape: { type: string }
+                taggedSpecies: { type: string }
+                taggedHealthy: { type: boolean }
+                status: { type: string, enum: [PENDING, VERIFIED] }
+                isArchived: { type: boolean }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+                  results: { $ref: '#/components/schemas/Classification' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Unauthorized }
+        '404': { description: Not found }
+        '500': { $ref: '#/components/responses/ServerError' }
+    delete:
+      summary: Delete classification (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+                  results: { $ref: '#/components/schemas/Classification' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Unauthorized }
+        '404': { description: Not found }
+        '500': { $ref: '#/components/responses/ServerError' }
+  /users:
+    get:
+      summary: List users (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: page
+          schema: { type: integer, minimum: 1, default: 1 }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 10 }
+        - in: query
+          name: sortBy
+          schema: { type: string, default: createdAt }
+        - in: query
+          name: sortOrder
+          schema: { type: string, enum: [asc, desc], default: desc }
+        - in: query
+          name: search
+          schema: { type: string }
+        - in: query
+          name: role
+          schema: { type: string, default: ALL }
+        - in: query
+          name: isArchived
+          schema: { type: string, enum: [true, false, undefined] }
+        - in: query
+          name: requestedContributorStatus
+          schema: { type: string, enum: [true, false, undefined] }
+        - in: query
+          name: createdAt_gte
+          schema: { type: string, format: date-time }
+        - in: query
+          name: createdAt_lte
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count: { type: integer }
+                  requestedContributorCount: { type: integer }
+                  pages: { type: integer }
+                  results:
+                    type: array
+                    items: { $ref: '#/components/schemas/UserWithCounts' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Unauthorized }
+        '500': { $ref: '#/components/responses/ServerError' }
+  /user/{id}:
+    get:
+      summary: Get user (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+                  results: { $ref: '#/components/schemas/User' }
+                  classificationCount: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Unauthorized }
+        '404': { description: Not found }
+        '500': { $ref: '#/components/responses/ServerError' }
+    put:
+      summary: Update user (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                fullName: { type: string }
+                email: { type: string }
+                phone: { type: string }
+                institution: { type: string }
+                department: { type: string }
+                location: { type: string }
+                bio: { type: string }
+                emailNotifications: { type: boolean }
+                role: { type: string }
+                isArchived: { type: boolean }
+                requestedContributorStatus: { type: boolean }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Unauthorized }
+        '404': { description: Not found }
+        '500': { $ref: '#/components/responses/ServerError' }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  responses:
+    Unauthorized:
+      description: Unauthorized
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ServerError:
+      description: Internal server error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Classification:
+      type: object
+      properties:
+        id: { type: string }
+        taggedSpecies: { type: string }
+        taggedShape: { type: string }
+        taggedHealthy: { type: boolean }
+        status: { type: string }
+        isArchived: { type: boolean }
+        imagePath: { type: string }
+        userId: { type: string }
+    ClassificationWithUser:
+      allOf:
+        - $ref: '#/components/schemas/Classification'
+        - type: object
+          properties:
+            user:
+              type: object
+              properties:
+                id: { type: string }
+                email: { type: string }
+                fullName: { type: string }
+    User:
+      type: object
+      properties:
+        id: { type: string }
+        email: { type: string }
+        fullName: { type: string }
+        role: { type: string }
+        isArchived: { type: boolean }
+        requestedContributorStatus: { type: boolean }
+    UserWithCounts:
+      allOf:
+        - $ref: '#/components/schemas/User'
+        - type: object
+          properties:
+            classificationCount: { type: integer }
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+        message: { type: string }

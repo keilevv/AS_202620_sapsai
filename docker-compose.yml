@@ -1,0 +1,110 @@
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: leaf-db
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/prisma/migrations:/docker-entrypoint-initdb.d/migrations
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U leafuser -d leafapp"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - leaf-network
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: leaf-backend
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    env_file:
+      - ./backend/.env
+    environment:
+      - NODE_ENV=development
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-leafuser}:${POSTGRES_PASSWORD:-sanautos2022}@db:5432/${POSTGRES_DB:-leafapp}?schema=public
+      - CLASSIFY_SERVICE_URL=http://classifier:8000
+    volumes:
+      - ./backend:/usr/src/app
+      - /usr/src/app/node_modules
+      - ./backend/prisma:/usr/src/app/prisma
+    command: >
+      sh -c "bunx prisma generate &&
+             bunx prisma migrate deploy &&
+             bun run dev"
+    networks:
+      - leaf-network
+
+  classifier:
+    build:
+      context: ./classifier
+    container_name: leaf-classifier
+    restart: unless-stopped
+    volumes:
+      - ./classifier/models:/app/models
+      - ./classifier/backups:/app/backups
+    ports:
+      - "8000:8000"
+    networks:
+      - leaf-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    container_name: leaf-frontend
+    depends_on:
+      - backend
+    ports:
+      - "5173:5173"
+    env_file:
+      - ./frontend/.env
+    restart: unless-stopped
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    networks:
+      - leaf-network
+
+  test:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: leaf-test
+    depends_on:
+      - db
+      - backend
+      - classifier
+    env_file:
+      - ./backend/.env
+    environment:
+      - NODE_ENV=test
+      - BACKEND_URL=http://backend:5000
+      - CLASSIFIER_URL=http://classifier:8000
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-leafuser}:${POSTGRES_PASSWORD:-sanautos2022}@db:5432/${POSTGRES_DB:-leafapp}?schema=public
+    volumes:
+      - ./backend:/usr/src/app
+    command: >
+      sh -c "bunx prisma generate &&
+             bunx prisma migrate deploy &&
+             bun test:integration"
+    networks:
+      - leaf-network
+
+networks:
+  leaf-network:
+    driver: bridge
+
+volumes:
+  postgres_data:

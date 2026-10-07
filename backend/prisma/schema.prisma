@@ -1,0 +1,82 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../node_modules/.prisma/client"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  USER
+  CONTRIBUTOR
+  MODERATOR
+  ADMIN
+}
+
+model User {
+  id                         String           @id @default(cuid())
+  email                      String           @unique
+  fullName                   String
+  phone                      String?
+  passwordHash               String? // Will be null for Google users
+  googleId                   String?          @unique
+  createdAt                  DateTime         @default(now())
+  classifications            Classification[] // <-- Add this line
+  speciesCreated             Species[]
+  role                       UserRole         @default(USER)
+  updatedAt                  DateTime         @default(now())
+  department                 String?
+  institution                String?
+  location                   String?
+  bio                        String?
+  emailNotifications         Boolean          @default(true)
+  isArchived                 Boolean          @default(false)
+  language                   String           @default("EN")
+  requestedContributorStatus Boolean          @default(false)
+}
+
+enum ClassificationStatus {
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+model Classification {
+  id                String               @id @default(cuid())
+  imagePath         String
+  originalFilename  String
+  species           String
+  shape             String
+  speciesConfidence Float
+  shapeConfidence   Float
+  taggedSpecies     String               @default("")
+  taggedShape       String               @default("")
+  taggedHealthy     Boolean              @default(true)
+  createdAt         DateTime             @default(now())
+  user              User                 @relation(fields: [userId], references: [id])
+  userId            String
+  isArchived        Boolean              @default(false)
+  updatedAt         DateTime             @default(now())
+  status            ClassificationStatus @default(PENDING)
+  isHealthy         Boolean              @default(true)
+  isPlant           Boolean              @default(false)
+  commonNameEn      String?
+  commonNameEs      String?
+  scientificName    String?
+  speciesId         String?
+}
+
+model Species {
+  id             String   @id @default(cuid())
+  commonNameEs   String
+  commonNameEn   String
+  slug           String?  @unique
+  scientificName String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @default(now())
+  isArchived     Boolean  @default(false)
+  createdBy      User     @relation(fields: [createdById], references: [id])
+  createdById    String
+}

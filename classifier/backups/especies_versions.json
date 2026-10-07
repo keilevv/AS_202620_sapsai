@@ -1,0 +1,25 @@
+{
+  "versions": [
+    {
+      "version": 2,
+      "timestamp": "2026-10-07T02:24:45.682638",
+      "timestamp_str": "20261007T022445",
+      "filename": "modelo_especies_v0002_20261007T022445.h5",
+      "path": "/home/keilevv/projects/leaf_classifier/classifier/backups/modelo_especies_v0002_20261007T022445.h5",
+      "notes": "Reentrenamiento automático - 2026-10-07 02:24:45",
+      "size_bytes": 32471648,
+      "source_path": "/home/keilevv/projects/leaf_classifier/classifier/app/../models/modelo_especies_v0002_20261006T232743.h5"
+    },
+    {
+      "version": 1,
+      "timestamp_str": "20260927T000000",
+      "filename": "modelo_especies.h5",
+      "path": "/home/keilevv/projects/leaf_classifier/classifier/backups/modelo_especies.h5",
+      "timestamp": "2026-09-27T00:00:00",
+      "size_bytes": 32471648,
+      "notes": "Base version"
+    }
+  ],
+  "current_version": 2,
+  "last_updated": "2026-10-07T03:50:37.761177"
+}

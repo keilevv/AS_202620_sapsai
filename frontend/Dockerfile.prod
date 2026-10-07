@@ -1,0 +1,41 @@
+# Build stage
+FROM oven/bun:1 AS builder
+
+WORKDIR /usr/src/app
+
+# Install dependencies
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile
+
+# Copy source code
+COPY . .
+
+# Set environment variables for build
+ARG VITE_API_URL
+ENV VITE_API_URL=${VITE_API_URL}
+
+# Build the app
+RUN echo "VITE_API_URL=${VITE_API_URL}" > .env.production
+RUN bun run build
+
+# Production stage
+FROM nginx:alpine
+
+# Install gettext for envsubst
+RUN apk add --no-cache gettext
+
+# Copy built files
+COPY --from=builder /usr/src/app/dist /usr/share/nginx/html
+
+# Copy nginx config templates and startup script
+COPY nginx/nginx.conf /nginx-templates/nginx.conf
+COPY nginx/nginx.temp.conf /nginx-templates/nginx.temp.conf
+COPY start.sh /start.sh
+RUN chmod +x /start.sh
+
+# Expose port 80
+EXPOSE 80
+EXPOSE 443
+
+# Start Nginx
+CMD ["/start.sh"]

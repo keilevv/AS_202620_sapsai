@@ -1,0 +1,140 @@
+services:
+  # Database
+  db:
+    image: postgres:15-alpine
+    container_name: leaf-db
+    env_file:
+      - ./backend/.env.prod
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U leafuser -d leafapp"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - leaf-network
+
+  # Backend Service
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.prod
+    container_name: leaf-backend
+    environment:
+      - HOST=0.0.0.0
+      - PORT=5000
+    env_file:
+      - ./backend/.env.prod
+    volumes:
+      - ./backend/prisma:/usr/src/app/prisma
+    restart: unless-stopped
+    # Let the nginx-proxy handle external ports via VIRTUAL_HOST. Do not expose 5000 directly.
+    networks:
+      - leaf-network
+    command: >
+      sh -c "bunx prisma generate &&
+             bunx prisma migrate deploy &&
+             bun run start"
+
+  # Classifier Service
+  classifier:
+    build:
+      context: ./classifier
+      dockerfile: Dockerfile
+    container_name: leaf-classifier
+    volumes:
+      - ./classifier/models:/app/models
+      - ./classifier/backups:/app/backups
+    env_file:
+      - ./classifier/.env.prod
+    restart: unless-stopped
+    networks:
+      - leaf-network
+
+  # Frontend service (Nginx)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.prod
+      args:
+        VITE_API_URL: /api/v1
+    container_name: leaf-frontend
+    environment:
+      - VITE_API_URL=/api/v1
+      - DOMAIN=${DOMAIN}
+    depends_on:
+      - backend
+      - db
+    ports:
+      - "80:80"
+      - "443:443"
+    env_file:
+      - ./.env
+    volumes:
+      - ./certbot/conf:/etc/letsencrypt:ro
+      - ./certbot/www:/var/www/certbot:ro
+    restart: unless-stopped
+    networks:
+      - leaf-network
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  # One-shot certificate issuance on first boot
+  certbot_init:
+    image: certbot/certbot
+    container_name: certbot-init
+    environment:
+      - DOMAIN=${DOMAIN}
+      - EMAIL=${EMAIL}
+    volumes:
+      - ./certbot/conf:/etc/letsencrypt
+      - ./certbot/www:/var/www/certbot
+    entrypoint: "/bin/sh"
+    command:
+      - -c
+      - |
+        if [ ! -f /etc/letsencrypt/live/$$DOMAIN/fullchain.pem ]; then
+          sleep 15
+          certbot certonly --non-interactive --agree-tos --email $$EMAIL --webroot -w /var/www/certbot -d $$DOMAIN
+        else
+          echo 'Certificate already exists'
+        fi
+    depends_on:
+      frontend:
+        condition: service_healthy
+    networks:
+      - leaf-network
+    restart: "no"
+    profiles:
+      - init
+
+  # Certbot service for SSL certificate management
+  certbot:
+    image: certbot/certbot
+    container_name: certbot
+    environment:
+      - DOMAIN=${DOMAIN}
+      - EMAIL=${EMAIL}
+    volumes:
+      - ./certbot/conf:/etc/letsencrypt
+      - ./certbot/www:/var/www/certbot
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew --quiet && echo \"Certificate renewal check completed at $$(date)\"; sleep 12h & wait $${!}; done;'"
+    networks:
+      - leaf-network
+    restart: unless-stopped
+    depends_on:
+      - frontend
+
+networks:
+  leaf-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  frontend-dist:

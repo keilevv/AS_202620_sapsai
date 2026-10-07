@@ -1,0 +1,18 @@
+FROM oven/bun:1.1-alpine
+
+WORKDIR /app
+
+# Accept Vite envs if needed (though .env is usually enough for dev)
+ARG VITE_API_URL
+ENV VITE_API_URL=${VITE_API_URL}
+
+COPY package.json ./
+RUN bun install
+
+# Copying code is still good for the image, 
+# although we will likely override with a volume in compose
+COPY . .
+
+EXPOSE 5173
+
+CMD ["bun", "run", "dev"]

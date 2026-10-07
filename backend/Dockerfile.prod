@@ -1,0 +1,57 @@
+# Production Dockerfile
+FROM oven/bun:1-slim AS builder
+
+WORKDIR /usr/src/app
+
+# Ensure OpenSSL is available for Prisma during build
+RUN apt-get update -y && \
+    apt-get install -y --no-install-recommends openssl && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install development dependencies first
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile
+
+# Copy Prisma schema and generate client
+COPY prisma ./prisma
+RUN bunx prisma generate
+
+# Copy the rest of the application
+COPY . .
+
+# Build the application
+RUN bun run build
+
+# Production stage
+FROM oven/bun:1-slim
+
+WORKDIR /usr/src/app
+
+# Ensure OpenSSL is available for Prisma at runtime
+RUN apt-get update -y && \
+    apt-get install -y --no-install-recommends openssl && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install production dependencies only
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile --production
+
+# Copy generated Prisma client and necessary files
+COPY --from=builder /usr/src/app/node_modules/.prisma ./node_modules/.prisma
+COPY --from=builder /usr/src/app/node_modules/@prisma ./node_modules/@prisma
+COPY --from=builder /usr/src/app/dist ./dist
+COPY --from=builder /usr/src/app/prisma ./prisma
+
+# Set environment to production
+ENV NODE_ENV=production
+ENV HOST=localhost
+ENV PORT=5000
+
+# Expose the port the app runs on
+EXPOSE 5000
+
+# Generate Prisma client and run migrations on container start
+CMD bunx prisma generate && \
+    bunx prisma migrate deploy && \
+    bun run start
+

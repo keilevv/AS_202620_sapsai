@@ -1,0 +1,173 @@
+openapi: 3.0.3
+info:
+  title: Auth API
+  version: 1.0.0
+  description: Authentication endpoints (local and Google OAuth)
+servers:
+  - url: /api/auth
+paths:
+  /google:
+    get:
+      summary: Start Google OAuth
+      description: Redirects user to Google for authentication
+      parameters:
+        - in: query
+          name: redirectTo
+          schema: { type: string }
+          description: Optional path in the frontend to return to after login
+      responses:
+        '302':
+          description: Redirect to Google
+  /google/callback:
+    get:
+      summary: Google OAuth callback
+      description: Handles Google callback and redirects to frontend with JWTs as query params
+      responses:
+        '302':
+          description: Redirect to frontend with access and refresh tokens
+  /login:
+    post:
+      summary: Local login
+      description: Authenticate with email and password
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+            examples:
+              login:
+                value: { email: user@example.com, password: Secret123 }
+      responses:
+        '200':
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+                  user: { $ref: '#/components/schemas/User' }
+                  accessToken: { type: string }
+              examples:
+                success:
+                  value:
+                    message: Login successful
+                    user: { id: u_123, email: user@example.com, role: USER }
+                    accessToken: <jwt>
+        '400':
+          description: Login failed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /register:
+    post:
+      summary: Register user
+      description: Create a new user with local credentials
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fullName, email, password, phone]
+              properties:
+                fullName: { type: string }
+                email: { type: string, format: email }
+                password: { type: string }
+                phone: { type: string }
+            examples:
+              register:
+                value:
+                  fullName: Jane Doe
+                  email: jane@example.com
+                  password: Secret123
+                  phone: "+57..."
+      responses:
+        '200':
+          description: Registration successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  message: { type: string }
+                  user: { $ref: '#/components/schemas/User' }
+                  accessToken: { type: string }
+  /logout:
+    get:
+      summary: Logout
+      description: Ends the session (passport session-based)
+      responses:
+        '200':
+          description: Logged out
+          content:
+            text/plain:
+              schema: { type: string }
+              examples:
+                out: { value: Logged out }
+  /me:
+    get:
+      summary: Current user
+      description: Returns the logged-in user and a fresh access token
+      responses:
+        '200':
+          description: Current user
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: '#/components/schemas/User' }
+                  accessToken: { type: string }
+        '401':
+          description: Not logged in
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /refresh-token:
+    post:
+      summary: Refresh tokens
+      description: Exchange a refresh token for a new access and refresh token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken: { type: string }
+            examples:
+              refresh:
+                value: { refreshToken: <jwt> }
+      responses:
+        '200':
+          description: New tokens
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accessToken: { type: string }
+                  refreshToken: { type: string }
+        '400': { description: No refresh token provided }
+        '401': { description: Invalid or expired refresh token }
+components:
+  schemas:
+    User:
+      type: object
+      properties:
+        id: { type: string }
+        email: { type: string }
+        role: { type: string }
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+        message: { type: string }

@@ -1,0 +1,89 @@
+.agents
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+plant-leaf-dataset/
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env.prod
+*.env*
+
+# Project specific
+backend/uploads/
+
+# Dependencies
+node_modules/
+**/*Zone.Identifier
+
+# Output
+out/
+dist/
+*.tgz
+*.pth
+
+# Logs
+logs/
+*.log
+_.log
+
+# Coverage
+coverage/
+*.lcov
+
+# Reports
+report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
+
+# Caches
+.cache/
+.eslintcache
+*.tsbuildinfo
+
+# System Files
+.DS_Store
+
+# Editor directories and files
+.idea
+.vscode
+*.swp
+*.swo
+
+/certbot/conf/renewal

@@ -1,0 +1,222 @@
+openapi: 3.0.3
+info:
+  title: Plant Classifier API
+  version: 1.0.0
+  description: Upload and manage image classifications
+servers:
+  - url: /api/plant-classifier
+paths:
+  /upload:
+    post:
+      summary: Upload image for classification
+      description: Uploads an image file, forwards to classifier service, stores result and image (R2 or local), and creates a DB entry
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                image:
+                  type: string
+                  format: binary
+      responses:
+        '200':
+          description: Classified
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+                  classification: { $ref: '#/components/schemas/Classification' }
+                  storageType: { type: string, enum: [R2, local] }
+                  imageUrl: { type: string }
+              examples:
+                ok:
+                  value:
+                    message: Image uploaded and classified successfully
+                    classification:
+                      id: cls_123
+                      species: mangifera_indica
+                      shape: ovate
+                      taggedHealthy: true
+                    storageType: R2
+                    imageUrl: https://r2.example.com/bucket/key.jpg
+        '400':
+          description: Bad request (e.g., no image or no_plant)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                noImage: { value: { error: 'No image uploaded' } }
+                notPlant: { value: { error: 'no_plant', message: 'Image is not a plant' } }
+        '500': { $ref: '#/components/responses/ServerError' }
+  /upload/{id}:
+    get:
+      summary: Get single upload
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result: { $ref: '#/components/schemas/Classification' }
+        '403': { description: Forbidden }
+        '500': { $ref: '#/components/responses/ServerError' }
+  /classifications:
+    get:
+      summary: List classifications
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: page
+          schema: { type: integer, minimum: 1, default: 1 }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 10 }
+        - in: query
+          name: sortBy
+          schema: { type: string, default: createdAt }
+        - in: query
+          name: sortOrder
+          schema: { type: string, enum: [asc, desc], default: desc }
+        - in: query
+          name: createdAt_gte
+          schema: { type: string, format: date-time }
+        - in: query
+          name: createdAt_lte
+          schema: { type: string, format: date-time }
+        - in: query
+          name: search
+          schema: { type: string }
+        - in: query
+          name: status
+          schema: { type: string, enum: [ALL, PENDING, VERIFIED] }
+        - in: query
+          name: isArchived
+          schema: { type: string, enum: [true, false] }
+        - in: query
+          name: isHealthy
+          schema: { type: string, enum: [true, false] }
+        - in: query
+          name: userId
+          schema: { type: string }
+          description: Admin only; filter by user id
+        - in: query
+          name: originalFilename
+          schema: { type: string }
+        - in: query
+          name: classification
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count: { type: integer }
+                  pages: { type: integer }
+                  results:
+                    type: array
+                    items: { $ref: '#/components/schemas/ClassificationWithUser' }
+                  shapes:
+                    type: array
+                    items: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/ServerError' }
+  /classifications/{id}:
+    patch:
+      summary: Update classification (self)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                taggedSpecies: { type: string }
+                taggedShape: { type: string }
+                taggedHealthy: { type: boolean }
+                isArchived: { type: boolean }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+                  results: { $ref: '#/components/schemas/Classification' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Unauthorized }
+        '404': { description: Not found }
+        '500': { $ref: '#/components/responses/ServerError' }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  responses:
+    Unauthorized:
+      description: Unauthorized
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Classification:
+      type: object
+      properties:
+        id: { type: string }
+        originalFilename: { type: string }
+        imagePath: { type: string }
+        species: { type: string }
+        shape: { type: string }
+        taggedSpecies: { type: string }
+        taggedShape: { type: string }
+        taggedHealthy: { type: boolean }
+        speciesConfidence: { type: number }
+        shapeConfidence: { type: number }
+        isHealthy: { type: boolean }
+        isArchived: { type: boolean }
+        userId: { type: string }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+    ClassificationWithUser:
+      allOf:
+        - $ref: '#/components/schemas/Classification'
+        - type: object
+          properties:
+            user:
+              type: object
+              nullable: true
+              properties:
+                id: { type: string }
+                email: { type: string }
+                fullName: { type: string }
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+        message: { type: string }

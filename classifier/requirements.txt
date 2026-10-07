@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+tensorflow
+pillow
+numpy
+python-multipart
+boto3
+python-dotenv
+matplotlib
+seaborn
+scikit-learn
+# Testing dependencies
+pytest>=7.4.0
+pytest-cov>=4.1.0
+pytest-asyncio>=0.21.0
+httpx>=0.24.0

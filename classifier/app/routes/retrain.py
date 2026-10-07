@@ -1,0 +1,1269 @@
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import JSONResponse
+import threading
+import tensorflow as tf
+import os
+from datetime import datetime
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from ..config import (
+    MODEL_DIR, DATA_DIR, BACKUP_DIR, MAX_BACKUPS,
+    CLOUDFLARE_R2_BUCKET_NAME, CLOUDFLARE_R2_ACCOUNT_ID,
+    CLOUDFLARE_R2_ACCESS_KEY_ID, CLOUDFLARE_R2_SECRET_ACCESS_KEY,
+    CLOUDFLARE_R2_PREFIX
+)
+from ..utils.label_detector import detect_new_classes, update_config_with_new_classes, update_config_with_detected_classes, adjust_model_for_new_classes, reload_config
+from ..utils.cloudflare_downloader import download_verified_images_from_r2
+from ..utils.model_versioning import create_model_version, list_model_versions, restore_model_version, get_version_info
+from ..models_loader import reload_model
+import urllib.request
+import json
+
+# Global training status tracker
+# Format: {model_name: {'is_training': bool, 'started_at': datetime, 'thread': Thread}}
+training_status = {}
+training_lock = threading.Lock()
+
+def send_training_webhook(model_name: str, status: str, message: str):
+    url = "http://localhost:5000/api/internal/webhook/training-status"
+    data = {"model": model_name, "status": status, "message": message}
+    try:
+        req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), headers={'Content-Type': 'application/json'})
+        urllib.request.urlopen(req, timeout=5)
+    except Exception as e:
+        print(f"Failed to send webhook: {e}")
+
+def get_gpu_info():
+    """Obtiene información sobre las GPUs disponibles y su configuración"""
+    gpus = tf.config.list_physical_devices('GPU')
+    info = {
+        'gpus_available': len(gpus),
+        'gpus': []
+    }
+    
+    for i, gpu in enumerate(gpus):
+        try:
+            details = tf.config.experimental.get_device_details(gpu)
+            try:
+                memory_info = tf.config.experimental.get_memory_info(gpu)
+                memory_usage = {
+                    'current_gb': memory_info['current'] / (1024**3),
+                    'peak_gb': memory_info['peak'] / (1024**3)
+                }
+            except Exception:
+                memory_usage = None
+            
+            info['gpus'].append({
+                'index': i,
+                'name': gpu.name,
+                'details': details if details else {},
+                'memory_usage': memory_usage
+            })
+        except Exception as e:
+            info['gpus'].append({
+                'index': i,
+                'name': gpu.name,
+                'error': str(e)
+            })
+    
+    return info
+
+def init_retrain_route():
+    bp = APIRouter(prefix="/retrain", tags=["retrain"])
+
+    @bp.get("/preview")
+    def preview_retrain(model: str = Query(..., description="Modelo a reentrenar")):
+        if model not in ['especies', 'hojas', 'plantas']:
+            raise HTTPException(status_code=400, detail="Modelo inválido")
+            
+        # Migrate initial Kaggle dataset to retrain structure if needed
+        try:
+            from ..utils.dataset_migrator import migrate_initial_dataset
+            migrate_initial_dataset(DATA_DIR, model)
+        except Exception as e:
+            print(f"Error migrating initial dataset: {e}")
+            
+        if model == 'especies':
+            try:
+                if all([
+                    CLOUDFLARE_R2_BUCKET_NAME,
+                    CLOUDFLARE_R2_ACCOUNT_ID,
+                    CLOUDFLARE_R2_ACCESS_KEY_ID,
+                    CLOUDFLARE_R2_SECRET_ACCESS_KEY
+                ]):
+                    print("Sincronizando imágenes verificadas de Cloudflare R2 para el preview...")
+                    download_verified_images_from_r2(
+                        bucket_name=CLOUDFLARE_R2_BUCKET_NAME,
+                        account_id=CLOUDFLARE_R2_ACCOUNT_ID,
+                        access_key_id=CLOUDFLARE_R2_ACCESS_KEY_ID,
+                        secret_access_key=CLOUDFLARE_R2_SECRET_ACCESS_KEY,
+                        prefix=CLOUDFLARE_R2_PREFIX,
+                        base_dir=None
+                    )
+            except Exception as e:
+                print(f"Error sincronizando imágenes de R2 en preview: {e}")
+
+        data_path = os.path.join(DATA_DIR, model, "train")
+        if not os.path.exists(data_path):
+            return {"status": "error", "message": "Directorio de datos no existe"}
+            
+        classes = {}
+        total_images = 0
+        total_to_augment = 0
+        target_per_class = 1000
+        
+        for cls in os.listdir(data_path):
+            cls_path = os.path.join(data_path, cls)
+            if os.path.isdir(cls_path):
+                imgs = [f for f in os.listdir(cls_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                count = len(imgs)
+                classes[cls] = {
+                    "current": count,
+                    "to_augment": max(0, target_per_class - count) if count > 0 else 0
+                }
+                total_images += count
+                total_to_augment += classes[cls]["to_augment"]
+                
+        return {
+            "status": "success",
+            "model": model,
+            "classes": classes,
+            "total_images": total_images,
+            "total_to_augment": total_to_augment,
+            "target_per_class": target_per_class
+        }
+
+
+    @bp.post(
+        "",
+        summary="Reentrenar modelo",
+        description="""
+        Inicia el reentrenamiento de un modelo específico. El entrenamiento se ejecuta en un hilo separado
+        para no bloquear la API.
+        
+        **Proceso automático:**
+        1. Se crea automáticamente una versión del modelo actual antes de sobrescribir
+        2. Se detectan nuevas clases en los datos de entrenamiento
+        3. Se ajusta el modelo si hay cambios en las clases
+        4. Se entrena el modelo (usa GPU si está disponible)
+        5. Se guarda el nuevo modelo
+        6. Se recarga automáticamente y queda disponible para predicciones
+        
+        **Sistema de versionado:**
+        - Cada reentrenamiento crea una nueva versión numerada del modelo anterior
+        - Las versiones se guardan en `backups/` con nombres como `modelo_especies_v0001_20240101T120000.h5`
+        - Se mantienen automáticamente las 3 versiones más recientes
+        - Puedes restaurar versiones anteriores usando `/retrain/restore-version`
+        
+        **Notas:**
+        - El entrenamiento puede tardar varios minutos dependiendo del tamaño del dataset
+        - El modelo reentrenado queda disponible inmediatamente sin reiniciar la aplicación
+        - Si hay error, el modelo anterior ya está guardado en versiones y puede restaurarse
+        """,
+        response_description="Estado del entrenamiento iniciado"
+    )
+    def retrain_model(model: str = Query(..., description="Modelo a reentrenar: especies, hojas o plantas")):
+        if model not in ['especies', 'hojas', 'plantas']:
+            raise HTTPException(
+                status_code=400,
+                detail="Debes especificar ?model=especies | hojas | plantas"
+            )
+
+        # Check if training is already in progress for this model
+        with training_lock:
+            if model in training_status and training_status[model]['is_training']:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"El modelo {model} ya está siendo entrenado. Por favor espera a que termine el entrenamiento actual."
+                )
+            # Set training status
+            training_status[model] = {
+                'is_training': True,
+                'started_at': datetime.utcnow().isoformat()
+            }
+
+        def train_thread(model_name):
+            # Descargar imágenes verificadas de Cloudflare R2 ANTES del entrenamiento
+            # Solo para el modelo de especies
+            if model_name == 'especies':
+                print(f"\n{'='*60}")
+                print(f"Descargando imágenes verificadas de Cloudflare R2...")
+                print(f"{'='*60}")
+                
+                # Verificar que las credenciales estén configuradas
+                if all([
+                    CLOUDFLARE_R2_BUCKET_NAME,
+                    CLOUDFLARE_R2_ACCOUNT_ID,
+                    CLOUDFLARE_R2_ACCESS_KEY_ID,
+                    CLOUDFLARE_R2_SECRET_ACCESS_KEY
+                ]):
+                    try:
+                        print(f"📥 Iniciando descarga desde bucket: {CLOUDFLARE_R2_BUCKET_NAME}")
+                        stats = download_verified_images_from_r2(
+                            bucket_name=CLOUDFLARE_R2_BUCKET_NAME,
+                            account_id=CLOUDFLARE_R2_ACCOUNT_ID,
+                            access_key_id=CLOUDFLARE_R2_ACCESS_KEY_ID,
+                            secret_access_key=CLOUDFLARE_R2_SECRET_ACCESS_KEY,
+                            prefix=CLOUDFLARE_R2_PREFIX,
+                            base_dir=None  # Usa DATA_DIR/especies/train por defecto
+                        )
+                        print(f"✅ Descarga completada: {stats['downloaded']} nuevas, {stats['skipped']} omitidas, {stats['errors']} errores")
+                        print(f"{'='*60}\n")
+                    except Exception as e:
+                        print(f"⚠️  Error al descargar imágenes de Cloudflare R2: {e}")
+                        print(f"   Continuando con el entrenamiento con los datos existentes...")
+                        print(f"{'='*60}\n")
+                else:
+                    print(f"⚠️  Credenciales de Cloudflare R2 no configuradas.")
+                    print(f"   Para habilitar la descarga automática, configura las variables de entorno:")
+                    print(f"   - CLOUDFLARE_R2_BUCKET_NAME")
+                    print(f"   - CLOUDFLARE_R2_ACCOUNT_ID")
+                    print(f"   - CLOUDFLARE_R2_ACCESS_KEY_ID")
+                    print(f"   - CLOUDFLARE_R2_SECRET_ACCESS_KEY")
+                    print(f"   Continuando con el entrenamiento con los datos existentes...")
+                    print(f"{'='*60}\n")
+            
+            # Combinar datos iniciales
+            try:
+                from ..utils.dataset_migrator import migrate_initial_dataset
+                migrate_initial_dataset(DATA_DIR, model_name)
+            except Exception as e:
+                print(f"Error migrando datos iniciales: {e}")
+            
+            # Habilitar memory growth para todas las GPUs disponibles
+            gpus = tf.config.list_physical_devices('GPU')
+            print(f"\n{'='*60}")
+            print(f"Información de GPU para entrenamiento de {model_name}")
+            print(f"{'='*60}")
+            
+            if gpus:
+                print(f"GPUs detectadas: {len(gpus)}")
+                for i, gpu in enumerate(gpus):
+                    try:
+                        tf.config.experimental.set_memory_growth(gpu, True)
+                        details = tf.config.experimental.get_device_details(gpu)
+                        print(f"  GPU {i}: {gpu.name}")
+                        if details:
+                            for key, value in details.items():
+                                print(f"    {key}: {value}")
+                    except Exception as e:
+                        print(f"  GPU {i}: {gpu.name} - Error: {e}")
+                print(f"{'='*60}\n")
+                print("💡 TIP: Abre otra terminal y ejecuta 'watch -n 1 nvidia-smi' para monitorear el uso de GPU en tiempo real")
+                print(f"{'='*60}\n")
+                
+                # CRÍTICO: Asegurar que TensorFlow use GPU por defecto
+                # Configurar variables de entorno para forzar uso de GPU
+                os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+                # Establecer que TensorFlow debe usar GPU
+                tf.config.set_visible_devices(gpus[0], 'GPU')
+                print("✅ GPU configurada como dispositivo visible para TensorFlow")
+            else:
+                print("⚠️  No se detectaron GPUs. Se usará CPU para entrenamiento.")
+                print(f"{'='*60}\n")
+            
+            print(f"Reentrenando modelo {model_name}...")
+            model_path = os.path.join(MODEL_DIR, f"modelo_{model_name}.h5")
+            data_path = os.path.join(DATA_DIR, model_name)
+            train_data_path = os.path.join(data_path, "train")
+            
+            # Validate that training data directory exists
+            if not os.path.exists(train_data_path):
+                error_msg = f"❌ ERROR: El directorio de datos de entrenamiento no existe: {train_data_path}"
+                print(error_msg)
+                print(f"   Por favor, asegúrate de que el directorio existe y contiene las clases de entrenamiento.")
+                raise FileNotFoundError(f"Training data directory not found: {train_data_path}")
+            
+            # Validate that training data directory is not empty
+            if not os.listdir(train_data_path):
+                error_msg = f"❌ ERROR: El directorio de datos de entrenamiento está vacío: {train_data_path}"
+                print(error_msg)
+                print(f"   Por favor, agrega imágenes de entrenamiento organizadas por clases.")
+                raise ValueError(f"Training data directory is empty: {train_data_path}")
+
+            # --- NUEVO PASO DE AUMENTO DE IMÁGENES ---
+            print(f"Realizando aumento de imágenes en {train_data_path} si es necesario...")
+            try:
+                from ..utils.augmentation import augment_images_in_dir
+                target_count = 1000
+                total_augmented = 0
+                for cls in os.listdir(train_data_path):
+                    cls_dir = os.path.join(train_data_path, cls)
+                    if os.path.isdir(cls_dir):
+                        print(f"Verificando clase {cls}...")
+                        augmented = augment_images_in_dir(cls_dir, target_count)
+                        total_augmented += augmented
+                        if augmented > 0:
+                            print(f"  + {augmented} imágenes generadas para {cls}")
+                print(f"✅ Aumento completado. Total de imágenes generadas: {total_augmented}")
+            except Exception as aug_e:
+                print(f"⚠️ Error durante el aumento de imágenes: {aug_e}")
+            # -----------------------------------------
+
+
+            # Detectar clases en los datos DESPUÉS de descargar (si se descargaron)
+            print(f"Detectando clases en los datos para {model_name}...")
+            class_info = detect_new_classes(model_name)
+            detected_classes = class_info['detected_classes']
+            num_detected_classes = len(detected_classes)
+            
+            print(f"Clases detectadas en los datos: {num_detected_classes} ({detected_classes})")
+            
+            # SIEMPRE actualizar la configuración con todas las clases detectadas en orden alfabético
+            # Esto asegura que el orden en config.py coincida con el orden que usa ImageDataGenerator
+            print(f"Actualizando configuración con todas las clases detectadas en orden alfabético...")
+            if update_config_with_detected_classes(model_name, detected_classes):
+                # Recargar la configuración para aplicar los cambios
+                reload_config()
+                print("✅ Configuración actualizada y recargada exitosamente.")
+            else:
+                print("⚠️  Error al actualizar la configuración.")
+            
+            if class_info['has_changes']:
+                print(f"Nuevas clases detectadas: {class_info['new_classes']}")
+                if class_info['removed_classes']:
+                    print(f"Clases removidas: {class_info['removed_classes']}")
+            else:
+                print(f"No se detectaron cambios en las clases para {model_name} (solo actualización de orden)")
+
+            # Detectar dispositivo automáticamente (GPU o CPU)
+            gpus = tf.config.list_physical_devices('GPU')
+            use_gpu = bool(gpus)
+            
+            if use_gpu:
+                device = '/GPU:0'
+                print(f"\n🖥️  Dispositivo detectado: GPU")
+                print("✅ GPU disponible - El entrenamiento se ejecutará en GPU")
+                # Asegurar que GPU es visible y configurada
+                try:
+                    tf.config.experimental.set_memory_growth(gpus[0], True)
+                    print("   ✅ Memory growth habilitado para GPU")
+                except Exception as e:
+                    print(f"   ⚠️  Advertencia al configurar memory growth: {e}")
+            else:
+                device = '/CPU:0'
+                print(f"\n🖥️  Dispositivo detectado: CPU")
+                print("⚠️  No se detectó GPU - El entrenamiento se ejecutará en CPU")
+                print("   💡 El entrenamiento será más lento pero funcionará correctamente")
+
+            # Cargar y entrenar en GPU si hay, de lo contrario en CPU
+            with tf.device(device):
+                model = tf.keras.models.load_model(model_path)
+                
+                # Verificar el número de clases en el modelo actual
+                # Manejar casos donde output puede ser una lista o un tensor
+                if isinstance(model.output, list):
+                    current_model_classes = model.output[0].shape[-1]
+                else:
+                    current_model_classes = model.output.shape[-1]
+                print(f"Clases en el modelo actual: {current_model_classes}")
+                print(f"Clases detectadas en los datos: {num_detected_classes}")
+                
+                # Ajustar modelo si el número de clases no coincide
+                if current_model_classes != num_detected_classes:
+                    print(f"Ajustando modelo: de {current_model_classes} a {num_detected_classes} clases...")
+                    
+                    # Calcular cuántas clases faltan
+                    classes_to_add = num_detected_classes - current_model_classes
+                    
+                    if classes_to_add > 0:
+                        # Obtener las clases nuevas detectadas
+                        new_classes_from_config = class_info.get('new_classes', [])
+                        
+                        # Crear un generador temporal para obtener el orden exacto de clases
+                        datagen = ImageDataGenerator(rescale=1./255)
+                        temp_gen = datagen.flow_from_directory(
+                            os.path.join(data_path, "train"),
+                            target_size=(128, 128),
+                            batch_size=1,
+                            class_mode='categorical',
+                            shuffle=False
+                        )
+                        # Obtener todas las clases en el orden que el generador las tiene
+                        all_classes_sorted = sorted(temp_gen.class_indices.keys(), key=lambda x: temp_gen.class_indices[x])
+                        
+                        # Las clases que el modelo tiene actualmente son las primeras current_model_classes
+                        model_current_classes = all_classes_sorted[:current_model_classes]
+                        
+                        # Las clases que faltan son las que están en all_classes_sorted pero no en model_current_classes
+                        new_classes_needed = [cls for cls in all_classes_sorted if cls not in model_current_classes]
+                        
+                        # Asegurarse de que tenemos exactamente classes_to_add clases
+                        if len(new_classes_needed) != classes_to_add:
+                            # Si hay discrepancia, tomar las últimas classes_to_add clases
+                            new_classes_needed = all_classes_sorted[-classes_to_add:]
+                        
+                        print(f"Agregando {len(new_classes_needed)} clases al modelo: {new_classes_needed}")
+                        model = adjust_model_for_new_classes(model, model_name, new_classes_needed)
+                        print("Modelo ajustado exitosamente.")
+                        
+                        # Limpiar el generador temporal
+                        del temp_gen
+                    else:
+                        # El modelo tiene más clases que las detectadas - esto es problemático
+                        # Por ahora, creamos un nuevo modelo con el número correcto de clases
+                        print(f"ADVERTENCIA: El modelo tiene más clases ({current_model_classes}) que las detectadas ({num_detected_classes})")
+                        print("Reconstruyendo la capa de salida...")
+                        
+                        # Obtener la penúltima capa
+                        penultimate_layer = model.layers[-2]
+                        
+                        # Crear nueva capa de salida con el número correcto de clases
+                        if model_name == 'plantas':
+                            new_output = tf.keras.layers.Dense(
+                                num_detected_classes,
+                                activation='sigmoid',
+                                name='new_output'
+                            )(penultimate_layer.output)
+                        else:
+                            new_output = tf.keras.layers.Dense(
+                                num_detected_classes,
+                                activation='softmax',
+                                name='new_output'
+                            )(penultimate_layer.output)
+                        
+                        # Crear nuevo modelo
+                        model = tf.keras.Model(inputs=model.input, outputs=new_output)
+                        print("Modelo reconstruido con el número correcto de clases.")
+                else:
+                    print("El modelo ya tiene el número correcto de clases.")
+
+                # Detectar recursos disponibles y ajustar batch size automáticamente
+                if use_gpu:
+                    # Obtener información de VRAM disponible
+                    try:
+                        gpu_devices = tf.config.list_physical_devices('GPU')
+                        if gpu_devices:
+                            # Intentar obtener información de memoria de GPU
+                            try:
+                                memory_info = tf.config.experimental.get_memory_info('GPU:0')
+                                total_memory = memory_info['limit'] / (1024**3)  # Convertir a GB
+                                # Estimar memoria disponible (restar ~500MB para sistema y otros procesos)
+                                available_memory_gb = total_memory - 0.5
+                                print(f"   💾 VRAM total detectada: {total_memory:.2f} GB")
+                                print(f"   💾 VRAM disponible estimada: {available_memory_gb:.2f} GB")
+                            except:
+                                # Fallback: usar detalles de dispositivo
+                                try:
+                                    details = tf.config.experimental.get_device_details(gpu_devices[0])
+                                    if 'device_memory_size' in details:
+                                        total_memory = details['device_memory_size'] / (1024**3)
+                                        available_memory_gb = total_memory - 0.5
+                                        print(f"   💾 VRAM total detectada: {total_memory:.2f} GB")
+                                        print(f"   💾 VRAM disponible estimada: {available_memory_gb:.2f} GB")
+                                    else:
+                                        # Si no podemos obtener info, usar valores conservadores
+                                        available_memory_gb = 1.5  # Asumir ~1.5GB disponible
+                                        print(f"   ⚠️  No se pudo detectar VRAM exacta, usando estimación conservadora: {available_memory_gb:.2f} GB")
+                                except:
+                                    available_memory_gb = 1.5
+                                    print(f"   ⚠️  No se pudo detectar VRAM, usando estimación conservadora: {available_memory_gb:.2f} GB")
+                            
+                            # Calcular batch_size óptimo según VRAM disponible
+                            # Estimación: cada imagen 128x128x3 usa ~0.2MB en memoria (con gradientes y overhead)
+                            # Con modelo cargado, reservamos ~2GB, así que usamos el resto para batches
+                            # batch_size * 0.2MB * 4 (overhead) = memoria por batch
+                            # Queremos usar ~60% de la memoria disponible para batches
+                            memory_for_batches_gb = available_memory_gb * 0.6
+                            memory_for_batches_mb = memory_for_batches_gb * 1024
+                            
+                            # Cada batch usa aproximadamente: batch_size * 0.2MB * 4 = batch_size * 0.8MB
+                            # batch_size = memory_for_batches_mb / 0.8
+                            estimated_batch_size = int(memory_for_batches_mb / 0.8)
+                            
+                            # Ajustar según rangos de VRAM conocidos
+                            if available_memory_gb >= 8:
+                                # GPU con 8GB+ (RTX 3070, 3080, etc.)
+                                batch_size = min(estimated_batch_size, 256)
+                            elif available_memory_gb >= 4:
+                                # GPU con 4-8GB (GTX 1650 Ti, RTX 2060, etc.)
+                                batch_size = min(estimated_batch_size, 128)
+                            elif available_memory_gb >= 2:
+                                # GPU con 2-4GB
+                                batch_size = min(estimated_batch_size, 64)
+                            else:
+                                # GPU con menos de 2GB disponible
+                                batch_size = min(estimated_batch_size, 32)
+                            
+                            # Asegurar batch_size mínimo
+                            if batch_size < 8:
+                                batch_size = 8
+                            
+                            print(f"   📦 Batch size calculado automáticamente: {batch_size} (basado en {available_memory_gb:.2f} GB VRAM disponible)")
+                            print(f"   ⚠️  Si hay OOM, se reducirá automáticamente")
+                        else:
+                            batch_size = 64
+                            print(f"   📦 Batch size por defecto: {batch_size} (no se detectó GPU)")
+                    except Exception as e:
+                        print(f"   ⚠️  Error detectando VRAM: {e}")
+                        batch_size = 64  # Fallback conservador
+                        print(f"   📦 Usando batch size conservador: {batch_size}")
+                else:
+                    # CPU: usar batch size más pequeño
+                    batch_size = 32
+                    print(f"   📦 Batch size para CPU: {batch_size}")
+                
+                print(f"   📦 Configurando batch size: {batch_size} {'(GPU optimizado)' if use_gpu else '(CPU)'}")
+                
+                # Validate training data directory again before creating generators
+                if not os.path.exists(train_data_path):
+                    raise FileNotFoundError(f"Training data directory not found: {train_data_path}")
+                if not os.listdir(train_data_path):
+                    raise ValueError(f"Training data directory is empty: {train_data_path}")
+                
+                print(f"   📁 Usando datos de entrenamiento desde: {train_data_path}")
+                
+                # Count total images to determine if we can use validation split
+                total_images = 0
+                for class_dir in os.listdir(train_data_path):
+                    class_path = os.path.join(train_data_path, class_dir)
+                    if os.path.isdir(class_path):
+                        # Count image files in this class directory
+                        image_files = [f for f in os.listdir(class_path) 
+                                     if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif'))]
+                        total_images += len(image_files)
+                
+                print(f"   📊 Total de imágenes encontradas: {total_images}")
+                
+                # Determine validation split based on available data
+                # Need at least 5 images per class on average for a 20% validation split
+                # If we have very few images, skip validation or use a smaller split
+                use_validation = total_images >= 10
+                validation_split = 0.2 if use_validation else 0.0
+                
+                if not use_validation:
+                    print(f"   ⚠️  Pocas imágenes ({total_images}). Se entrenará sin conjunto de validación.")
+                    print(f"   💡 Se recomienda tener al menos 10 imágenes para usar validación.")
+                else:
+                    print(f"   ✅ Usando {validation_split*100:.0f}% de los datos para validación.")
+                
+                datagen = ImageDataGenerator(rescale=1./255, validation_split=validation_split)
+                try:
+                    train_gen = datagen.flow_from_directory(
+                        train_data_path,
+                        target_size=(128, 128),
+                        batch_size=batch_size,
+                        subset='training',
+                        class_mode='categorical'
+                    )
+                    
+                    # Only create validation generator if we're using validation
+                    val_gen = None
+                    if use_validation:
+                        val_gen = datagen.flow_from_directory(
+                            train_data_path,
+                            target_size=(128, 128),
+                            batch_size=batch_size,
+                            subset='validation',
+                            class_mode='categorical'
+                        )
+                        
+                        # Verify validation set has images
+                        if val_gen.samples == 0:
+                            print(f"   ⚠️  El conjunto de validación está vacío. Continuando sin validación.")
+                            val_gen = None
+                            use_validation = False
+                except FileNotFoundError as e:
+                    error_msg = f"❌ ERROR: No se pudo acceder al directorio de datos de entrenamiento: {train_data_path}"
+                    print(error_msg)
+                    print(f"   Error: {str(e)}")
+                    raise
+                except Exception as e:
+                    error_msg = f"❌ ERROR: Error al crear generadores de datos: {str(e)}"
+                    print(error_msg)
+                    raise
+                
+                # Verificar que el número de clases del generador coincide con el modelo
+                train_num_classes = train_gen.num_classes
+                # Manejar casos donde output puede ser una lista o un tensor
+                if isinstance(model.output, list):
+                    model_output_classes = model.output[0].shape[-1]
+                else:
+                    model_output_classes = model.output.shape[-1]
+                print(f"Verificación final: Generador tiene {train_num_classes} clases, Modelo tiene {model_output_classes} clases")
+                
+                if train_num_classes != model_output_classes:
+                    raise ValueError(
+                        f"Incompatibilidad: El generador tiene {train_num_classes} clases pero el modelo tiene {model_output_classes} clases. "
+                        f"Ajuste el modelo antes de continuar."
+                    )
+
+                # Verificar en qué dispositivo está el modelo antes de compilar
+                print(f"\n📍 Verificando dispositivo del modelo...")
+                if hasattr(model, 'layers') and len(model.layers) > 0:
+                    # Verificar la primera capa para ver dónde está el modelo
+                    first_layer = model.layers[0]
+                    if hasattr(first_layer, 'weights') and len(first_layer.weights) > 0:
+                        device_location = first_layer.weights[0].device
+                        print(f"   Dispositivo del modelo: {device_location}")
+                        if '/GPU' in str(device_location):
+                            print("   ✅ Modelo está en GPU")
+                        else:
+                            print("   ⚠️  Modelo está en CPU")
+                
+                # Forzar uso de GPU explícitamente si está disponible
+                if use_gpu:
+                    print(f"\n🔧 Configurando para forzar uso de GPU...")
+                    # Verificar que TensorFlow vea la GPU
+                    available_gpus = tf.config.list_physical_devices('GPU')
+                    print(f"   GPUs físicas: {len(available_gpus)}")
+                    print(f"   GPUs lógicas: {len(tf.config.list_logical_devices('GPU'))}")
+                    
+                    if available_gpus:
+                        # Asegurar que todas las operaciones se ejecuten en GPU
+                        # Configurar para que TensorFlow use GPU por defecto
+                        try:
+                            tf.config.experimental.set_memory_growth(available_gpus[0], True)
+                            print("   ✅ GPU configurada con memory growth")
+                        except Exception as e:
+                            print(f"   ⚠️  Error configurando memory growth: {e}")
+                
+                # Compilar modelo - esto debe hacerse dentro del contexto de GPU
+                print(f"\n⚙️  Compilando modelo...")
+                model.compile(optimizer=tf.keras.optimizers.Adam(1e-5),
+                              loss='categorical_crossentropy',
+                              metrics=['accuracy'])
+
+                # Verificar dispositivo después de compilar
+                print(f"   Verificando dispositivo después de compilar...")
+                if hasattr(model, 'layers') and len(model.layers) > 0:
+                    first_layer = model.layers[0]
+                    if hasattr(first_layer, 'weights') and len(first_layer.weights) > 0:
+                        device_location = first_layer.weights[0].device
+                        print(f"   Dispositivo: {device_location}")
+                        if '/GPU' in str(device_location):
+                            print("   ✅ Modelo compilado en GPU")
+                        else:
+                            print("   ⚠️  Modelo compilado en CPU - esto puede afectar el rendimiento")
+                
+                # Ejecutar entrenamiento dentro del contexto de GPU
+                print(f"\n🚀 Iniciando entrenamiento en {device}...")
+                print(f"   Batch size: {batch_size}")
+                print(f"   Epochs: 5")
+                print(f"   ⚠️  IMPORTANTE: Verifica nvidia-smi - deberías ver 80-100% de utilización\n")
+                
+                # Configurar para maximizar uso de GPU
+                if use_gpu:
+                    print(f"   🔧 Optimizaciones para GPU:")
+                    
+                    # IMPORTANTE: Deshabilitar mixed precision si causa problemas de memoria
+                    # Mixed precision puede causar OOM en GPUs con poca memoria
+                    use_mixed_precision = False  # Deshabilitado por defecto para evitar OOM
+                    
+                    if use_mixed_precision:
+                        try:
+                            policy = tf.keras.mixed_precision.Policy('mixed_float16')
+                            tf.keras.mixed_precision.set_global_policy(policy)
+                            print("      ✅ Mixed precision habilitado (puede aumentar memoria)")
+                        except Exception as e:
+                            print(f"      ℹ️  Mixed precision no disponible")
+                    else:
+                        print("      ℹ️  Mixed precision deshabilitado (para evitar OOM en 4GB VRAM)")
+                    
+                    # Configurar para usar GPU agresivamente
+                    try:
+                        tf.config.optimizer.set_jit(True)  # Habilitar XLA JIT
+                        print("      ✅ XLA JIT habilitado")
+                    except Exception as e:
+                        print(f"      ℹ️  XLA JIT no disponible")
+                    
+                    # Nota: Los threads ya están configurados en app/config.py al inicio
+                    print("      ✅ Threads ya configurados al inicio")
+                
+                # Ejecutar entrenamiento - ya estamos dentro del contexto with tf.device(device)
+                # por lo que todas las operaciones se ejecutarán en el dispositivo correcto
+                print(f"\n   ⚡ Ejecutando entrenamiento...")
+                if use_validation and val_gen:
+                    print(f"   📊 Conjunto de entrenamiento: {train_gen.samples} imágenes")
+                    print(f"   📊 Conjunto de validación: {val_gen.samples} imágenes")
+                else:
+                    print(f"   📊 Conjunto de entrenamiento: {train_gen.samples} imágenes")
+                    print(f"   ⚠️  Entrenando sin validación (pocas imágenes disponibles)")
+                if use_gpu:
+                    print(f"   📊 Monitorea nvidia-smi - deberías ver 80-100% de utilización")
+                print(f"   💡 Si ves baja utilización, el modelo puede ser pequeño - considera aumentar batch_size\n")
+                
+                # Intentar entrenar con manejo de errores de memoria
+                try:
+                    # NO limpiar sesión aquí - el modelo ya está cargado y compilado
+                    # Solo hacer garbage collection para liberar memoria del sistema
+                    if use_gpu:
+                        import gc
+                        gc.collect()
+                        print(f"   🧹 Memoria del sistema limpiada")
+                    
+                    # Use validation data only if available
+                    fit_kwargs = {
+                        'epochs': 5,
+                        'verbose': 1
+                    }
+                    if use_validation and val_gen and val_gen.samples > 0:
+                        fit_kwargs['validation_data'] = val_gen
+                    
+                    history = model.fit(train_gen, **fit_kwargs)
+                except (tf.errors.ResourceExhaustedError, RuntimeError, Exception) as e:
+                    error_msg = str(e)
+                    # Detectar errores de memoria de GPU
+                    is_oom = ('OOM' in error_msg or 
+                             'out of memory' in error_msg.lower() or 
+                             'ResourceExhaustedError' in error_msg or 
+                             'ran out of memory' in error_msg.lower() or
+                             'Allocator' in error_msg and 'memory' in error_msg.lower())
+                    
+                    if is_oom:
+                        # Si hay error de memoria, reducir batch size y reintentar
+                        print(f"\n   ⚠️  ERROR: Memoria de GPU insuficiente con batch_size={batch_size}")
+                        print(f"   🔄 Reduciendo batch_size a {batch_size // 2} y reintentando...\n")
+                        
+                        # Limpiar memoria de GPU pero NO usar clear_session (destruye el modelo)
+                        import gc
+                        gc.collect()
+                        
+                        # Reducir batch size
+                        batch_size = batch_size // 2
+                        if batch_size < 8:
+                            print(f"   ❌ Batch size muy pequeño ({batch_size}). El entrenamiento puede ser muy lento.")
+                            print(f"   💡 Considera reducir el tamaño del modelo o usar CPU.")
+                            raise RuntimeError(f"Batch size demasiado pequeño después de reducir por OOM: {batch_size}")
+                        
+                        # Recrear generadores con nuevo batch size
+                        datagen = ImageDataGenerator(rescale=1./255, validation_split=validation_split)
+                        train_gen = datagen.flow_from_directory(
+                            train_data_path,
+                            target_size=(128, 128),
+                            batch_size=batch_size,
+                            subset='training',
+                            class_mode='categorical'
+                        )
+                        val_gen = None
+                        if use_validation:
+                            val_gen = datagen.flow_from_directory(
+                                train_data_path,
+                                target_size=(128, 128),
+                                batch_size=batch_size,
+                                subset='validation',
+                                class_mode='categorical'
+                            )
+                            if val_gen.samples == 0:
+                                val_gen = None
+                        
+                        # Recompilar modelo para asegurar que está en GPU
+                        print(f"   🔄 Recompilando modelo con batch_size={batch_size}...")
+                        model.compile(optimizer=tf.keras.optimizers.Adam(1e-5),
+                                      loss='categorical_crossentropy',
+                                      metrics=['accuracy'])
+                        
+                        print(f"   ✅ Batch size reducido a {batch_size}, reintentando entrenamiento en GPU...\n")
+                        # Asegurar que estamos en GPU al reintentar
+                        with tf.device('/GPU:0'):
+                            fit_kwargs = {
+                                'epochs': 5,
+                                'verbose': 1
+                            }
+                            if use_validation and val_gen and val_gen.samples > 0:
+                                fit_kwargs['validation_data'] = val_gen
+                            
+                            history = model.fit(train_gen, **fit_kwargs)
+                    else:
+                        # Re-lanzar el error si no es de memoria
+                        raise
+
+                # GENERATE METRICS
+                try:
+                    import matplotlib
+                    matplotlib.use('Agg')
+                    import matplotlib.pyplot as plt
+                    import seaborn as sns
+                    from sklearn.metrics import classification_report, confusion_matrix
+                    import numpy as np
+                    import json
+                    
+                    eval_gen = val_gen if (use_validation and val_gen and val_gen.samples > 0) else train_gen
+                    eval_gen.reset()
+                    y_true = eval_gen.classes
+                    y_pred_probs = model.predict(eval_gen, verbose=0)
+                    y_pred = np.argmax(y_pred_probs, axis=1)
+                    
+                    class_names = [k for k, v in sorted(eval_gen.class_indices.items(), key=lambda item: item[1])]
+                    cm = confusion_matrix(y_true, y_pred)
+                    
+                    fig, axes = plt.subplots(1, 2, figsize=(18, 7))
+                    ax = axes[0]
+                    ax.plot(history.history['loss'], label='Train Loss', color='#1f77b4', lw=2)
+                    if 'val_loss' in history.history:
+                        ax.plot(history.history['val_loss'], label='Val Loss', color='#ff7f0e', lw=2)
+                    ax.plot(history.history['accuracy'], label='Train Acc', color='#2ca02c', lw=2, ls='--')
+                    if 'val_accuracy' in history.history:
+                        ax.plot(history.history['val_accuracy'], label='Val Acc', color='#d62728', lw=2, ls='--')
+                    ax.set_title(f'{model_name.upper()} — Training Metrics', fontsize=14)
+                    ax.set_xlabel('Epoch')
+                    ax.set_ylabel('Value')
+                    ax.grid(True, linestyle='--', alpha=0.6)
+                    ax.legend()
+                    
+                    ax = axes[1]
+                    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names, cbar=False, ax=ax)
+                    ax.set_title(f'{model_name.upper()} — Confusion Matrix', fontsize=14)
+                    ax.set_xlabel('Predicted')
+                    ax.set_ylabel('True')
+                    plt.xticks(rotation=45, ha='right')
+                    plt.yticks(rotation=0)
+                    plt.tight_layout()
+                    
+                    metrics_img_path = os.path.join(MODEL_DIR, f'training_metrics_{model_name}.png')
+                    plt.savefig(metrics_img_path, dpi=150, bbox_inches='tight')
+                    plt.close()
+                    
+                    metrics_json_path = os.path.join(MODEL_DIR, f'training_metrics_{model_name}.json')
+                    with open(metrics_json_path, 'w') as f:
+                        json.dump({
+                            "classes": class_names,
+                            "num_classes": len(class_names),
+                            "samples": eval_gen.samples
+                        }, f)
+                    
+                    print("✅ Metrics and Confusion Matrix saved successfully.")
+                except Exception as metrics_e:
+                    print(f"⚠️ Error saving metrics: {metrics_e}")
+
+
+            training_error = None
+            try:
+                # Crear versión del modelo actual ANTES de guardar el nuevo
+                # Esto preserva el modelo anterior en backups
+                if os.path.exists(model_path):
+                    try:
+                        from datetime import datetime
+                        version_info = create_model_version(
+                            model_name, 
+                            version_notes=f"Reentrenamiento automático - {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}"
+                        )
+                        print(f"✅ Versión {version_info['version']} del modelo anterior creada: {version_info['filename']}")
+                    except Exception as version_error:
+                        print(f"⚠️  Error creando versión del modelo anterior: {version_error}")
+                        print(f"   Continuando con el guardado del nuevo modelo...")
+                
+                # Guardar nuevo modelo
+                model.save(model_path)
+
+                # Validar que el modelo guardado se puede cargar
+                _ = tf.keras.models.load_model(model_path)
+                print(f"Modelo {model_name} actualizado y validado.")
+                
+                # Recargar el modelo en el sistema global para que esté disponible para predicciones
+                print(f"Recargando modelo {model_name} en el sistema de predicción...")
+                try:
+                    reload_model(model_name)
+                    print(f"✅ Modelo {model_name} recargado y disponible para predicciones.")
+                except Exception as reload_error:
+                    print(f"⚠️  Error al recargar modelo {model_name} para predicciones: {reload_error}")
+                    print(f"   El modelo fue guardado correctamente, pero será necesario reiniciar la aplicación para usarlo.")
+
+            except FileNotFoundError as e:
+                error_msg = f"❌ ERROR CRÍTICO: Directorio de datos no encontrado para {model_name}"
+                print(f"\n{'='*60}")
+                print(error_msg)
+                print(f"   Ruta esperada: {os.path.join(DATA_DIR, model_name, 'train')}")
+                print(f"   Error: {str(e)}")
+                print(f"{'='*60}")
+                print(f"💡 SOLUCIÓN:")
+                print(f"   1. Asegúrate de que el directorio de datos existe")
+                print(f"   2. Para especies, las imágenes se descargan automáticamente desde Cloudflare R2")
+                print(f"   3. Verifica que las credenciales de R2 estén configuradas correctamente")
+                print(f"   4. O crea manualmente el directorio y organiza las imágenes por clases")
+                print(f"{'='*60}\n")
+                # Nota: Si hay error, el modelo anterior ya está guardado en versiones
+                # Se puede restaurar usando el endpoint de restauración de versiones
+                print(f"💡 Puedes restaurar una versión anterior usando el endpoint /retrain/restore-version")
+                training_error = str(e)
+            except ValueError as e:
+                error_msg = f"❌ ERROR CRÍTICO: Directorio de datos vacío para {model_name}"
+                print(f"\n{'='*60}")
+                print(error_msg)
+                print(f"   Ruta: {os.path.join(DATA_DIR, model_name, 'train')}")
+                print(f"   Error: {str(e)}")
+                print(f"{'='*60}")
+                print(f"💡 SOLUCIÓN:")
+                print(f"   1. Agrega imágenes de entrenamiento organizadas por clases")
+                print(f"   2. Cada clase debe estar en su propia carpeta dentro de 'train/'")
+                print(f"   3. Para especies, las imágenes se descargan automáticamente desde Cloudflare R2")
+                print(f"   4. Verifica que las credenciales de R2 estén configuradas correctamente")
+                print(f"{'='*60}\n")
+                training_error = str(e)
+            except Exception as e:
+                error_msg = f"❌ ERROR durante el entrenamiento de {model_name}"
+                print(f"\n{'='*60}")
+                print(error_msg)
+                print(f"   Error: {str(e)}")
+                print(f"   Tipo: {type(e).__name__}")
+                print(f"{'='*60}")
+                # Nota: Si hay error, el modelo anterior ya está guardado en versiones
+                # Se puede restaurar usando el endpoint de restauración de versiones
+                print(f"💡 Puedes restaurar una versión anterior usando el endpoint /retrain/restore-version")
+                training_error = str(e)
+            finally:
+                # Clear training status when done (success or error)
+                with training_lock:
+                    if model_name in training_status:
+                        training_status[model_name]['is_training'] = False
+                        training_status[model_name]['completed_at'] = datetime.utcnow().isoformat()
+                        # Store error information if training failed
+                        if training_error:
+                            training_status[model_name]['error'] = training_error
+                            send_training_webhook(model_name, "error", f"Error during training: {training_error}")
+                        else:
+                            send_training_webhook(model_name, "success", f"Model {model_name} successfully retrained!")
+
+        # Detectar clases antes de iniciar el entrenamiento para mostrar información inmediata
+        class_info = detect_new_classes(model)
+        
+        # Start training thread
+        thread = threading.Thread(target=train_thread, args=(model,))
+        thread.daemon = True  # Allow main process to exit even if thread is running
+        
+        send_training_webhook(model, "training", f"Model {model} is currently training...")
+        thread.start()
+        
+        # Store thread reference
+        with training_lock:
+            training_status[model]['thread'] = thread
+
+        response = {
+            "status": "Entrenamiento iniciado",
+            "model": model,
+            "classes_detected": class_info['detected_classes'],
+            "current_classes": class_info['current_classes'],
+            "new_classes": class_info['new_classes'],
+            "removed_classes": class_info['removed_classes'],
+            "has_changes": class_info['has_changes']
+        }
+        
+        if class_info['has_changes']:
+            response["message"] = f"Se detectaron {len(class_info['new_classes'])} nuevas clases y {len(class_info['removed_classes'])} clases removidas. El modelo será ajustado automáticamente."
+        else:
+            response["message"] = "No se detectaron cambios en las clases. El modelo será reentrenado con las clases existentes."
+
+        return response
+    
+    @bp.get(
+        "/status",
+        summary="Estado de entrenamiento",
+        description="""
+        Obtiene el estado actual de entrenamiento para un modelo específico.
+        
+        **Respuesta:**
+        - `is_training`: Indica si el modelo está siendo entrenado actualmente
+        - `started_at`: Timestamp de cuando comenzó el entrenamiento (si está en progreso)
+        - `completed_at`: Timestamp de cuando terminó el entrenamiento (si ya terminó)
+        """,
+        response_description="Estado de entrenamiento del modelo"
+    )
+    def get_training_status(model: str = Query(..., description="Modelo a consultar: especies, hojas o plantas")):
+        if model not in ['especies', 'hojas', 'plantas']:
+            raise HTTPException(
+                status_code=400,
+                detail="Debes especificar ?model=especies | hojas | plantas"
+            )
+        
+        with training_lock:
+            status = training_status.get(model, {
+                'is_training': False,
+                'started_at': None,
+                'completed_at': None
+            })
+            
+            return {
+                "model": model,
+                "is_training": status.get('is_training', False),
+                "started_at": status.get('started_at'),
+                "completed_at": status.get('completed_at')
+            }
+    
+    @bp.get(
+        "/check-classes",
+        summary="Verificar clases disponibles",
+        description="""
+        Verifica las clases disponibles en los datos de entrenamiento sin iniciar el entrenamiento.
+        Útil para ver qué clases se detectarían antes de reentrenar.
+        """
+    )
+    def check_classes(model: str = Query(..., description="Modelo a verificar: especies, hojas o plantas")):
+        if model not in ['especies', 'hojas', 'plantas']:
+            raise HTTPException(
+                status_code=400,
+                detail="Debes especificar ?model=especies | hojas | plantas"
+            )
+        
+        class_info = detect_new_classes(model)
+        
+        return {
+            "model": model,
+            "classes_detected": class_info['detected_classes'],
+            "current_classes": class_info['current_classes'],
+            "new_classes": class_info['new_classes'],
+            "removed_classes": class_info['removed_classes'],
+            "has_changes": class_info['has_changes'],
+            "message": f"Clases detectadas: {len(class_info['detected_classes'])}, Clases actuales: {len(class_info['current_classes'])}"
+        }
+    
+    @bp.post(
+        "/update-config",
+        summary="Actualizar configuración",
+        description="""
+        Actualiza la configuración de la aplicación con nuevas clases detectadas en los datos.
+        Esto actualiza las listas de clases en `config.py` sin necesidad de reentrenar.
+        """
+    )
+    def update_config(model: str = Query(..., description="Modelo a actualizar: especies, hojas o plantas")):
+        if model not in ['especies', 'hojas', 'plantas']:
+            raise HTTPException(
+                status_code=400,
+                detail="Debes especificar ?model=especies | hojas | plantas"
+            )
+        
+        class_info = detect_new_classes(model)
+        
+        if class_info['new_classes']:
+            if update_config_with_new_classes(model, class_info['new_classes']):
+                reload_config()
+                return {
+                    "status": "success",
+                    "model": model,
+                    "new_classes_added": class_info['new_classes'],
+                    "message": f"Configuración actualizada con {len(class_info['new_classes'])} nuevas clases"
+                }
+            else:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Error al actualizar la configuración"
+                )
+        else:
+            return {
+                "status": "info",
+                "message": "No hay nuevas clases para actualizar"
+            }
+    
+    @bp.get(
+        "/gpu-status",
+        summary="Estado de GPU",
+        description="""
+        Obtiene información detallada sobre el estado y uso de las GPUs disponibles.
+        Incluye información de TensorFlow y nvidia-smi (si está disponible).
+        """
+    )
+    def gpu_status():
+        try:
+            import subprocess
+            import json
+            
+            gpu_info = get_gpu_info()
+            
+            # Intentar obtener información detallada con nvidia-smi si está disponible
+            nvidia_smi_info = None
+            try:
+                result = subprocess.run(
+                    ['nvidia-smi', '--query-gpu=index,name,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu', 
+                     '--format=csv,noheader,nounits'],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode == 0:
+                    lines = result.stdout.strip().split('\n')
+                    nvidia_smi_info = []
+                    for line in lines:
+                        parts = [p.strip() for p in line.split(',')]
+                        if len(parts) >= 7:
+                            nvidia_smi_info.append({
+                                'index': parts[0],
+                                'name': parts[1],
+                                'gpu_utilization_percent': parts[2],
+                                'memory_utilization_percent': parts[3],
+                                'memory_used_mb': parts[4],
+                                'memory_total_mb': parts[5],
+                                'temperature_celsius': parts[6]
+                            })
+            except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
+                pass  # nvidia-smi no está disponible o falló
+            
+            return {
+                "tensorflow_gpu_info": gpu_info,
+                "nvidia_smi_info": nvidia_smi_info,
+                "message": "Usa 'watch -n 1 nvidia-smi' en terminal para monitoreo en tiempo real" if nvidia_smi_info else "nvidia-smi no disponible. Instálalo para ver uso detallado."
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error obteniendo información de GPU: {str(e)}")
+    
+    @bp.get(
+        "/versions",
+        summary="Listar versiones de modelo",
+        description="""
+        Lista todas las versiones disponibles de un modelo guardadas en backups.
+        
+        **Información de cada versión:**
+        - Número de versión (secuencial)
+        - Timestamp de creación
+        - Nombre del archivo
+        - Notas/descripción
+        - Tamaño del archivo
+        
+        **Notas:**
+        - Se mantienen automáticamente las 3 versiones más recientes (configurable)
+        - Las versiones se ordenan de más reciente a más antigua
+        - Solo se muestran versiones cuyos archivos aún existen
+        """,
+        response_description="Lista de versiones disponibles del modelo"
+    )
+    def list_versions(model: str = Query(..., description="Modelo a consultar: especies, hojas o plantas")):
+        if model not in ['especies', 'hojas', 'plantas']:
+            raise HTTPException(
+                status_code=400,
+                detail="Debes especificar ?model=especies | hojas | plantas"
+            )
+        
+        try:
+            versions = list_model_versions(model)
+            
+            # Read current_version from metadata (updated by restore/retrain)
+            from ..utils.model_versioning import load_version_metadata
+            metadata = load_version_metadata(model)
+            current_version = metadata.get('current_version')
+
+            return {
+                "model": model,
+                "total_versions": len(versions),
+                "versions": versions,
+                "current_version": current_version,
+                "message": f"Se encontraron {len(versions)} versiones del modelo {model}"
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error listando versiones: {str(e)}")
+    
+    @bp.get(
+        "/version-info",
+        summary="Información de versión específica",
+        description="""
+        Obtiene información detallada de una versión específica de un modelo.
+        
+        **Información incluida:**
+        - Número de versión
+        - Timestamp de creación
+        - Ruta del archivo
+        - Notas/descripción
+        - Tamaño del archivo en bytes
+        """
+    )
+    def get_version(model: str = Query(..., description="Modelo a consultar: especies, hojas o plantas"),
+                    version: int = Query(..., description="Número de versión a consultar")):
+        if model not in ['especies', 'hojas', 'plantas']:
+            raise HTTPException(
+                status_code=400,
+                detail="Debes especificar ?model=especies | hojas | plantas"
+            )
+        
+        try:
+            version_info = get_version_info(model, version)
+            if version_info is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No se encontró la versión {version} del modelo {model}"
+                )
+            return {
+                "model": model,
+                "version": version,
+                "version_info": version_info
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error obteniendo información de versión: {str(e)}")
+    
+    @bp.post(
+        "/restore-version",
+        summary="Restaurar versión de modelo",
+        description="""
+        Restaura una versión específica de un modelo, reemplazando el modelo actual.
+        
+        **Proceso de restauración:**
+        1. Se crea un backup del modelo actual antes de restaurar
+        2. Se copia la versión seleccionada al directorio de modelos activos
+        3. Se valida que el modelo restaurado se puede cargar correctamente
+        4. Se recarga automáticamente en el sistema de predicción
+        5. El modelo restaurado queda disponible inmediatamente para predicciones
+        
+        **Notas:**
+        - El modelo actual se reemplaza por la versión seleccionada
+        - Si hay error durante la validación, se restaura automáticamente el modelo original
+        - El modelo restaurado se recarga sin necesidad de reiniciar la aplicación
+        - Útil para revertir a una versión anterior si el nuevo modelo no funciona bien
+        """,
+        response_description="Resultado de la restauración con información de la versión"
+    )
+    def restore_version(model: str = Query(..., description="Modelo a restaurar: especies, hojas o plantas"),
+                       version: int = Query(..., description="Número de versión a restaurar")):
+        if model not in ['especies', 'hojas', 'plantas']:
+            raise HTTPException(
+                status_code=400,
+                detail="Debes especificar ?model=especies | hojas | plantas"
+            )
+        
+        try:
+            restore_result = restore_model_version(model, version)
+            
+            # Recargar el modelo restaurado en el sistema global
+            print(f"Recargando modelo {model} restaurado en el sistema de predicción...")
+            try:
+                reload_model(model)
+                print(f"✅ Modelo {model} restaurado y recargado correctamente.")
+                restore_result['reloaded'] = True
+            except Exception as reload_error:
+                print(f"⚠️  Error al recargar modelo {model} restaurado: {reload_error}")
+                restore_result['reloaded'] = False
+                restore_result['reload_error'] = str(reload_error)
+            
+            return {
+                "status": "success",
+                "message": f"Modelo {model} restaurado a la versión {version}",
+                **restore_result
+            }
+        except FileNotFoundError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error restaurando versión: {str(e)}")
+    
+    @bp.get(
+        "/metrics",
+        summary="Obtener métricas del último entrenamiento",
+        description="Obtiene el JSON de métricas y la imagen generada durante el último entrenamiento del modelo."
+    )
+    def get_metrics(model: str = Query(..., description="Modelo a consultar: especies, hojas o plantas")):
+        if model not in ['especies', 'hojas', 'plantas']:
+            raise HTTPException(status_code=400, detail="Modelo inválido")
+            
+        import os
+        import json
+        import base64
+        from ..config import MODEL_DIR
+        
+        json_path = os.path.join(MODEL_DIR, f'training_metrics_{model}.json')
+        img_path = os.path.join(MODEL_DIR, f'training_metrics_{model}.png')
+        
+        if not os.path.exists(json_path) or not os.path.exists(img_path):
+            raise HTTPException(status_code=404, detail="Métricas no encontradas para este modelo. Es posible que aún no se haya entrenado con la nueva versión.")
+            
+        try:
+            with open(json_path, 'r') as f:
+                metrics_data = json.load(f)
+                
+            with open(img_path, 'rb') as f:
+                img_base64 = base64.b64encode(f.read()).decode('utf-8')
+                
+            return {
+                "status": "success",
+                "model": model,
+                "metrics": metrics_data,
+                "image_base64": f"data:image/png;base64,{img_base64}"
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error leyendo métricas: {str(e)}")
+
+    return bp

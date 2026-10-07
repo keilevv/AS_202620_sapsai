@@ -1,0 +1,15 @@
+{
+  "versions": [
+    {
+      "version": 1,
+      "timestamp_str": "20260927T000000",
+      "filename": "modelo_plantas.h5",
+      "path": "/home/keilevv/projects/leaf_classifier/classifier/backups/modelo_plantas.h5",
+      "timestamp": "2026-09-27T00:00:00",
+      "size_bytes": 11544536,
+      "notes": "Base version"
+    }
+  ],
+  "current_version": 1,
+  "last_updated": "2026-09-27T00:00:00"
+}

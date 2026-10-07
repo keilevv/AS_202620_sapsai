@@ -1,0 +1,213 @@
+openapi: 3.0.3
+info:
+  title: Species API
+  version: 1.0.0
+  description: Endpoints for managing plant species
+servers:
+  - url: /api/species
+paths:
+  /:
+    get:
+      summary: List species
+      description: Paginated list of species with optional filters
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: page
+          schema: { type: integer, minimum: 1, default: 1 }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 10 }
+        - in: query
+          name: sortBy
+          schema: { type: string, default: createdAt }
+        - in: query
+          name: sortOrder
+          schema: { type: string, enum: [asc, desc], default: desc }
+        - in: query
+          name: createdAt_gte
+          schema: { type: string, format: date-time }
+        - in: query
+          name: createdAt_lte
+          schema: { type: string, format: date-time }
+        - in: query
+          name: search
+          schema: { type: string }
+        - in: query
+          name: isArchived
+          schema: { type: string, enum: [true, false] }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count: { type: integer }
+                  pages: { type: integer }
+                  results:
+                    type: array
+                    items: { $ref: '#/components/schemas/Species' }
+                  shapes:
+                    type: array
+                    items: { type: string }
+              examples:
+                success:
+                  value:
+                    count: 10
+                    pages: 1
+                    results:
+                      - id: sp_1
+                        scientificName: Mangifera indica
+                        commonNameEn: Mango
+                        commonNameEs: Mango
+                        slug: mangifera-indica
+                        isArchived: false
+                    shapes: [ovate, elliptic, cordate]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    post:
+      summary: Create species
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [scientificName, commonNameEn, commonNameEs]
+              properties:
+                scientificName: { type: string }
+                commonNameEn: { type: string }
+                commonNameEs: { type: string }
+            examples:
+              create:
+                value:
+                  scientificName: Mangifera indica
+                  commonNameEn: Mango
+                  commonNameEs: Mango
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  species: { $ref: '#/components/schemas/Species' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: Conflict
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                conflict:
+                  value: { error: 'Species with this slug already exists' }
+        '500': { $ref: '#/components/responses/ServerError' }
+  /admin/{id}/update:
+    patch:
+      summary: Update species (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [scientificName, commonNameEn, commonNameEs]
+              properties:
+                scientificName: { type: string }
+                commonNameEn: { type: string }
+                commonNameEs: { type: string }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  species: { $ref: '#/components/schemas/Species' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/ServerError' }
+  /admin/{id}/delete:
+    delete:
+      summary: Delete species (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  species: { $ref: '#/components/schemas/Species' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/ServerError' }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  responses:
+    Unauthorized:
+      description: Unauthorized
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            noToken: { value: { error: 'No token provided' } }
+    BadRequest:
+      description: Bad request
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ServerError:
+      description: Internal server error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Species:
+      type: object
+      properties:
+        id: { type: string }
+        scientificName: { type: string }
+        commonNameEn: { type: string }
+        commonNameEs: { type: string }
+        slug: { type: string }
+        isArchived: { type: boolean }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+        message: { type: string }
